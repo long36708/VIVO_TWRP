@@ -1,0 +1,1224 @@
+name: OrangeFox Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      SYNC_METHOD:
+        description: '源码同步方式 (pinned = 可复现, 默认; sync-script = 官方脚本兜底)'
+        required: true
+        default: 'pinned'
+        type: choice
+        options:
+          - pinned
+          - sync-script
+      SYNC_URL:
+        description: '橙狐同步脚本仓库 (OrangeFox sync)'
+        required: true
+        default: 'https://gitlab.com/OrangeFox/sync.git'
+      SYNC_REVISION:
+        description: 'OrangeFox/sync 仓库 revision (补丁来源; 必须与 pinned manifest 配套, 详见 manifests/PROVENANCE.md)'
+        required: true
+        default: '11e4406b2bd1de939a26b6bfbad7e371cc3b1fa7'
+      MANIFEST_BRANCH:
+        description: '橙狐源码分支'
+        required: true
+        default: '14.1'
+        type: choice
+        options:
+          - '14.1'
+          - '12.1'
+      DEVICE_TREE_URL:
+        description: 'DEVICE_TREE_URL'
+        required: true
+        default: 'https://github.com/long36708/device_vivo_pd2415_twrp'
+      DEVICE_TREE_BRANCH:
+        description: 'DEVICE_TREE_BRANCH'
+        required: true
+        default: 'main'
+      DEVICE_PATH:
+        description: 'DEVICE_PATH'
+        required: true
+        default: 'device/vivo/pd2415'
+      COMMON_TREE_URL:
+        description: 'COMMON_TREE_URL (if no common tree, leave blank)'
+        required: false
+      COMMON_PATH:
+        description: 'COMMON_PATH (if no common tree, leave blank)'
+        required: false
+      DEVICE_NAME:
+        description: 'DEVICE_NAME'
+        required: true
+        default: 'pd2415'
+      MAKEFILE_NAME:
+        description: 'MAKEFILE_NAME (不带 -eng 后缀)'
+        required: true
+        default: 'twrp_pd2415-ap2a'
+      BUILD_TARGET:
+        description: 'BUILD_TARGET (make 目标, 空格分隔)'
+        required: true
+        # PD2415 是 TARGET_NO_RECOVERY=true 的虚拟 A/B 设备, recovery 打进
+        # vendor_boot, 由 package-vendor-boot.sh 组装最终镜像。OrangeFox 14.1 文档
+        # 对 vendor_boot-as-recovery 只构建 vendorbootimage, 不构建 recoveryimage
+        # (后者在 14.1 上无此顶级目标, 跑了会 "No rule to make target" 直接失败)。
+        default: 'vendorbootimage'
+      JAVA_VERSION:
+        description: 'JAVA_VERSION (fox_14.1 用 17, fox_12.1 用 11)'
+        required: true
+        default: '17'
+      PUBLISH:
+        description: 'BUILD 成功后创建 prerelease'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orangefox-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ORANGEFOX_TOP: ${{ github.workspace }}/OrangeFox
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: '3G'
+  CCACHE_CACHE_VERSION: '1'
+  MIN_SWAP_GIB: '12'
+  # fox_14.1 源码 + out 峰值约需 83 GiB, 另留 3 GiB 编译缓存。
+  REQUIRED_DISK_GIB: '98'
+  # 删除 .repo 后仍要为 Soong 写入 out/ 保底。
+  REQUIRED_COMPILE_DISK_GIB: '38'
+  REQUIRED_MEMORY_GIB: '14'
+
+jobs:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Display Run Parameters
+        run: |
+          echo "::group::User Environment Variables"
+          echo "Sync Method: ${{ github.event.inputs.SYNC_METHOD }}"
+          echo "Sync URL: ${{ github.event.inputs.SYNC_URL }}"
+          echo "Sync Revision: ${{ github.event.inputs.SYNC_REVISION }}"
+          echo "OrangeFox branch: fox_${{ github.event.inputs.MANIFEST_BRANCH }}"
+          echo "Device Tree URL: ${{ github.event.inputs.DEVICE_TREE_URL }}"
+          echo "Device Tree Branch: ${{ github.event.inputs.DEVICE_TREE_BRANCH }}"
+          echo "Device Path: ${{ github.event.inputs.DEVICE_PATH }}"
+          echo "Device Name: ${{ github.event.inputs.DEVICE_NAME }}"
+          echo "Makefile Name: ${{ github.event.inputs.MAKEFILE_NAME }}-eng"
+          echo "Build Target: ${{ github.event.inputs.BUILD_TARGET }}"
+          echo "Java Version: ${{ github.event.inputs.JAVA_VERSION }}"
+          echo "::endgroup::"
+
+      - name: Check Out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: builder
+
+      # 清理镜像自带的无关负载, 比单纯 apt clean 释放更多空间。
+      - name: Free disk space
+        uses: rokibhasansagar/slimhub_actions@main
+
+      - name: Install host packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl device-tree-compiler flex g++-multilib \
+            gcc-multilib git git-lfs gnupg gperf imagemagick \
+            lib32ncurses-dev lib32readline-dev lib32z1-dev libelf-dev \
+            liblz4-tool libncurses-dev libsdl1.2-dev libssl-dev libxml2 \
+            libxml2-utils lz4 openjdk-${{ github.event.inputs.JAVA_VERSION }}-jdk-headless \
+            pngcrush python-is-python3 python3 ripgrep rsync schedtool squashfs-tools \
+            unzip xsltproc zip zlib1g-dev
+          sudo apt-get clean
+          java_home="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
+          test -x "${java_home}/bin/java"
+          echo "JAVA_HOME=${java_home}" >> "$GITHUB_ENV"
+
+      - name: Fetch device tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 \
+            ${{ github.event.inputs.DEVICE_TREE_URL }} \
+            -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} \
+            "$GITHUB_WORKSPACE/device-tree"
+          # LFS 指针文件会让后续的 blob 校验通过但内容为空, 必须落地实体文件。
+          if git -C "$GITHUB_WORKSPACE/device-tree" config --get-regexp '^filter\.lfs' >/dev/null 2>&1; then
+            git -C "$GITHUB_WORKSPACE/device-tree" lfs pull
+          fi
+
+      - name: Report source versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 必须显式打印实际使用的 commit。GitHub 的 "Re-run job" 会复用原运行
+          # 的 commit SHA, 不拉新提交; 若只看分支名, 会误以为在跑最新代码,
+          # 从而对着已修复的问题反复排查。
+          echo "::group::实际使用的代码版本"
+          echo -n "builder   : "
+          git -C "$GITHUB_WORKSPACE/builder" rev-parse HEAD
+          git -C "$GITHUB_WORKSPACE/builder" --no-pager log -1 --format='   %ci  %s'
+          echo -n "device    : "
+          git -C "$GITHUB_WORKSPACE/device-tree" rev-parse HEAD
+          git -C "$GITHUB_WORKSPACE/device-tree" --no-pager log -1 --format='   %ci  %s'
+          echo "::endgroup::"
+
+          # 设备树关键文件自检: 缺失时在这里就停, 而不是等到 sepolicy 编译失败。
+          dt="$GITHUB_WORKSPACE/device-tree"
+          for f in Android.mk AndroidProducts.mk BoardConfig.mk \
+                   recovery/prepare-ramdisk.sh recovery.fstab; do
+            if [[ ! -f "$dt/$f" ]]; then
+              echo "::warning::设备树缺少 $f"
+            fi
+          done
+          if [[ -d "$dt/sepolicy" ]]; then
+            echo "sepolicy 文件: $(ls "$dt/sepolicy")"
+            # 打印 genfs_contexts 的 genfscon 行, 便于核对类型是否都已声明
+            if [[ -f "$dt/sepolicy/genfs_contexts" ]]; then
+              grep -n '^genfscon' "$dt/sepolicy/genfs_contexts" || echo "  (无 genfscon 条目)"
+            fi
+          else
+            echo "::warning::设备树没有 sepolicy/ 目录"
+          fi
+
+      - name: Setup build swap
+        shell: bash
+        run: |
+          set -euo pipefail
+          MIN_SWAP_GIB="$MIN_SWAP_GIB" \
+            bash "$GITHUB_WORKSPACE/builder/.github/scripts/setup-swap.sh"
+
+      - name: Check runner capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          available_kib="$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 { print $4 }')"
+          required_kib=$((REQUIRED_DISK_GIB * 1024 * 1024))
+          if [[ -z "${available_kib}" || "${available_kib}" -lt "${required_kib}" ]]; then
+            echo "::error::需要至少 ${REQUIRED_DISK_GIB} GiB 可用空间 (清理后实测 $((available_kib / 1024 / 1024)) GiB)。请改用 larger runner。"
+            exit 1
+          fi
+          memory_kib="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
+          required_memory_kib=$((REQUIRED_MEMORY_GIB * 1024 * 1024))
+          if [[ -z "${memory_kib}" || "${memory_kib}" -lt "${required_memory_kib}" ]]; then
+            echo "::error::需要 ${REQUIRED_MEMORY_GIB} GiB 级内存 runner (实测 $((memory_kib / 1024 / 1024)) GiB)。"
+            exit 1
+          fi
+          df -h "$GITHUB_WORKSPACE"
+          free -h
+
+      - name: Restore compiler cache
+        id: ccache_restore
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: orangefox-ccache-${{ env.CCACHE_CACHE_VERSION }}-${{ runner.os }}-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.event.inputs.DEVICE_NAME }}
+          restore-keys: |
+            orangefox-ccache-${{ env.CCACHE_CACHE_VERSION }}-${{ runner.os }}-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.event.inputs.DEVICE_NAME }}-
+
+      - name: Configure compiler cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v ccache
+          install -d "$CCACHE_DIR"
+          ccache -M "$CCACHE_MAXSIZE"
+          ccache -z
+          ccache -p
+
+      - name: Install repo tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d "$HOME/bin"
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            --output "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Sync OrangeFox sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 修复 "unsupported checkout state": repo 浅克隆 (--depth=1) 同步中途网络
+          # 中断后, 个别项目的 .git 会进入 repo 无法自愈的损坏状态, 普通 repo sync
+          # 重试必然再次撞同一个坏状态 (典型就是 bootable/recovery)。唯一可靠的恢复
+          # 是删掉该项目的工作树与 .repo 存储, 让 repo 重新克隆。下面两路同步失败
+          # 时都会调用它解析坏项目并清理, 再重试。
+          recover_bad_projects() {
+            local log="$1"
+            [[ -f "$log" ]] || return 0
+            local paths
+            # 1) 直接匹配 "OrangeFox/<path>/.git: unsupported checkout state"
+            paths="$(grep -oE 'OrangeFox/[^ ]+/\.git' "$log" \
+                      | sed -E 's#^OrangeFox/##; s#/\.git$##' | sort -u)"
+            # 2) 兜底匹配 "Failing repos (checkout):" 段列出的项目名
+            if [[ -z "$paths" ]]; then
+              paths="$(sed -n '/Failing repos/,/^$/p' "$log" \
+                        | grep -vE 'Failing repos|^$' | tr -d ':' | sort -u)"
+            fi
+            [[ -z "$paths" ]] && return 0
+            for p in $paths; do
+              echo "  purging bad project: $p"
+              rm -rf "$ORANGEFOX_TOP/$p"
+              rm -rf "$ORANGEFOX_TOP/.repo/projects/$p.git"
+              rm -rf "$ORANGEFOX_TOP/.repo/project-objects/$p.git"
+            done
+          }
+
+          # 两种方式:
+          #   pinned (默认)   - 用 pinned manifest 锁定 662 个项目的 revision,
+          #   再应用本仓库 patches/ 下的配套补丁。可复现, 且补丁已针对该
+          #   revision 验证过 (源自 rodin 设备树), 推荐。
+          #   sync-script     - 用 orangefox_sync.sh。脚本与自带 patches/ 天然
+          #   配套, 一定自洽, 但结果不可复现。pinned 路径出问题时用它兜底。
+          #
+          # 注意: `repo manifest -r` 只记录 revision, 不记录工作区补丁!
+          # 所以 pinned 路径必须自行补打补丁 (见 Apply OrangeFox setup patches),
+          # 否则 build/make 缺少 BUILD_BROKEN_PLUGIN_VALIDATION, soong 引导会失败:
+          #   "New plugins are not supported; however ["soong-libaosprecovery_defaults"
+          #    "soong-libguitwrp_defaults" "soong-libminuitwrp_defaults"
+          #    "soong-vold_defaults"] were found."
+          use_pinned=0
+          pinned_manifest=""
+          if [[ "${{ github.event.inputs.SYNC_METHOD }}" = "pinned" ]]; then
+            # 查找顺序: 本构建仓库 manifests/ -> 设备树 manifests/。
+            for candidate in \
+              "$GITHUB_WORKSPACE/builder/manifests/orangefox-fox_${{ github.event.inputs.MANIFEST_BRANCH }}-pinned.xml" \
+              "$GITHUB_WORKSPACE/device-tree/manifests/orangefox-fox_${{ github.event.inputs.MANIFEST_BRANCH }}-pinned.xml"
+            do
+              if [[ -f "$candidate" ]]; then
+                pinned_manifest="$candidate"
+                use_pinned=1
+                break
+              fi
+            done
+            if [[ "$use_pinned" -eq 0 ]]; then
+              echo "::warning::SYNC_METHOD=pinned 但未找到 pinned manifest, 回退到 orangefox_sync.sh"
+            fi
+          fi
+
+          if [[ "$use_pinned" -eq 1 ]]; then
+            echo "pinned=1" >> "$GITHUB_OUTPUT"
+            echo "Using pinned manifest: $pinned_manifest"
+            # 附带校验和时先校验清单内容未被篡改。
+            if [[ -f "${pinned_manifest}.sha256" ]]; then
+              (
+                cd "$(dirname "$pinned_manifest")"
+                sha256sum --check --strict "$(basename "$pinned_manifest").sha256"
+              )
+            fi
+            manifest_repo="$GITHUB_WORKSPACE/pinned-manifest"
+            export GIT_CONFIG_GLOBAL="$GITHUB_WORKSPACE/ci-gitconfig"
+            mkdir -p "$manifest_repo"
+            cp "$pinned_manifest" "$manifest_repo/default.xml"
+            git -C "$manifest_repo" init --initial-branch=main --quiet
+            git -C "$manifest_repo" config user.name "OrangeFox CI"
+            git -C "$manifest_repo" config user.email "orangefox-ci@localhost"
+            git -C "$manifest_repo" add default.xml
+            git -C "$manifest_repo" commit --quiet -m "Pinned OrangeFox ${{ github.event.inputs.MANIFEST_BRANCH }} manifest"
+            git config --global protocol.file.allow always
+            # GitLab 偶发重置长连接; 容忍慢速 pack 传输。
+            git config --global http.lowSpeedLimit 1
+            git config --global http.lowSpeedTime 600
+
+            mkdir -p "$ORANGEFOX_TOP"
+            cd "$ORANGEFOX_TOP"
+            repo init --depth=1 -u "file://${manifest_repo}" -b main -m default.xml
+          else
+            echo "pinned=0" >> "$GITHUB_OUTPUT"
+            echo "Using orangefox_sync.sh (self-consistent, but not reproducible)."
+            sync_dir="$GITHUB_WORKSPACE/ofox-sync"
+            mkdir -p "$ORANGEFOX_TOP"
+            git clone --filter=blob:none ${{ github.event.inputs.SYNC_URL }} "$sync_dir"
+            if [[ -n "${{ github.event.inputs.SYNC_REVISION }}" ]]; then
+              git -C "$sync_dir" checkout --detach ${{ github.event.inputs.SYNC_REVISION }}
+              test "$(git -C "$sync_dir" rev-parse HEAD)" = "${{ github.event.inputs.SYNC_REVISION }}"
+            fi
+            # orangefox_sync.sh 会拉取 TWRP minimal manifest, 打上橙狐补丁,
+            # 再克隆 bootable/recovery 与 vendor/recovery 的 fox_<branch> 分支。
+            #
+            # 关键: 脚本用 BASE_DIR="$PWD" 定位 patches/patch-manifest-*.diff,
+            # 因此必须 cd 进同步仓库再执行, 否则会报
+            # "I cannot find the patch file: <cwd>/patches/... - quitting!"。
+            cd "$sync_dir"
+            test -f "patches/patch-manifest-fox_${{ github.event.inputs.MANIFEST_BRANCH }}.diff"
+
+            # 脚本内部会静默跑数小时的 repo sync; 没有输出会被 CI 判为超时。
+            (
+              while sleep 60; do
+                date -u '+%Y-%m-%dT%H:%M:%SZ sync heartbeat'
+                df -h "$GITHUB_WORKSPACE"
+                free -h
+              done
+            ) &
+            heartbeat_pid=$!
+            trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
+
+            ofox_ok=0
+            for sync_attempt in 1 2 3; do
+              if bash ./orangefox_sync.sh \
+                --branch ${{ github.event.inputs.MANIFEST_BRANCH }} \
+                --path "$ORANGEFOX_TOP" 2>&1 | tee /tmp/ofox-sync.log; then
+                ofox_ok=1
+                break
+              fi
+              echo "::warning::orangefox_sync.sh 第 ${sync_attempt} 次失败, 清理损坏项目后重试"
+              recover_bad_projects /tmp/ofox-sync.log
+              sleep 5
+            done
+            if [[ "$ofox_ok" -ne 1 ]]; then
+              echo "::error::orangefox_sync.sh 三次均失败, 见上方日志" >&2
+              kill "$heartbeat_pid" 2>/dev/null || true
+              trap - EXIT
+              exit 1
+            fi
+
+            kill "$heartbeat_pid" 2>/dev/null || true
+            trap - EXIT
+            exit 0
+          fi
+
+          (
+            while sleep 60; do
+              date -u '+%Y-%m-%dT%H:%M:%SZ sync heartbeat'
+              df -h "$GITHUB_WORKSPACE"
+              free -h
+            done
+          ) &
+          heartbeat_pid=$!
+          trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
+
+          sync_succeeded=0
+          for sync_attempt in 1 2 3 4; do
+            if repo sync -c -j4 --retry-fetches=3 --no-clone-bundle --no-tags --optimized-fetch \
+                 2>&1 | tee /tmp/repo-sync.log; then
+              sync_succeeded=1
+              break
+            fi
+            echo "::warning::同步第 ${sync_attempt} 次失败, 清理损坏项目后重试"
+            # 坏状态跨普通重试保留, 必须删掉坏项目的 .git 让 repo 重新克隆。
+            recover_bad_projects /tmp/repo-sync.log
+            sleep 5
+          done
+          if [[ "$sync_succeeded" -ne 1 ]]; then
+            echo "::error::源码同步三次均失败。" >&2
+            exit 1
+          fi
+
+          kill "$heartbeat_pid" 2>/dev/null || true
+          trap - EXIT
+        id: sync
+
+      - name: Apply OrangeFox setup patches
+        if: steps.sync.outputs.pinned == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # pinned manifest 只锁定源码 revision, 补丁仍需手工应用。
+          #
+          # 补丁来自本仓库 patches/ (源自 rodin 设备树, 已核对无设备专属内容):
+          #   orangefox-build-make.patch  -> build/make
+          #     定义 BUILD_BROKEN_PLUGIN_VALIDATION。缺了它 soong 引导会失败:
+          #     "New plugins are not supported; however ["soong-libaosprecovery_defaults"
+          #      "soong-libguitwrp_defaults" "soong-libminuitwrp_defaults"
+          #      "soong-vold_defaults"] were found."
+          #   orangefox-vendor-twrp.patch -> vendor/twrp
+          #     引入 bootable/recovery/orangefox_soong.mk 并加 soong 配置变量。
+          #
+          # 为什么不直接用 OrangeFox/sync 仓库的 patch-manifest-fox_14.1.diff:
+          # 那份补丁基于 TeamWin minimal manifest 的 build 项目生成, 而本清单里
+          # build/make 是 nebrassy 的 android_build (506df226), base 不同打不上。
+          # patches/ 里的这两份是 rodin 针对该 revision 生成的, 配套可用。
+          #
+          # 刻意不复制 orangefox-recovery.patch: 它 20 个文件里有 4 处 rodin
+          # 硬件专属改动 (Type-C VBUS 供电、SIH6887 马达 I2C), 对 MTK 平台的
+          # pd2415 是错的。详见 patches/README.md。
+
+          # 幂等应用: 已打过则跳过, 否则先 --check 再 apply, 失败报明确错误。
+          apply_patch() {
+            local target="$1" patch="$2"
+            if [[ ! -f "$patch" ]]; then
+              echo "::error::缺少补丁 $patch"
+              return 1
+            fi
+            if git -C "$target" apply --reverse --check "$patch" 2>/dev/null; then
+              echo "already applied: $patch -> $target"
+              return 0
+            fi
+            if ! git -C "$target" apply --check "$patch" 2>/dev/null; then
+              echo "::error::补丁无法应用 $patch -> $target"
+              echo "::error::通常是 pinned revision 与该补丁所基于的源码不一致, 改用 SYNC_METHOD=sync-script 或重新生成 pinned manifest"
+              return 1
+            fi
+            git -C "$target" apply "$patch"
+            echo "applied: $patch -> $target"
+          }
+
+          # 1) build/make —— 最关键。定义 BUILD_BROKEN_PLUGIN_VALIDATION,
+          #    缺了它 soong 引导会直接失败。
+          apply_patch "$ORANGEFOX_TOP/build/make" \
+            "$GITHUB_WORKSPACE/builder/patches/orangefox-build-make.patch"
+
+          # 2) vendor/twrp —— 引入 orangefox_soong.mk, 并加
+          #    tw_drm_blank_keep_pipeline 等 soong 配置变量。
+          apply_patch "$ORANGEFOX_TOP/vendor/twrp" \
+            "$GITHUB_WORKSPACE/builder/patches/orangefox-vendor-twrp.patch"
+
+          # 校验: 关键标记必须存在, 否则后续 soong 一定失败。
+          for marker in BUILD_BROKEN_PLUGIN_VALIDATION Fox_Before_Recovery_Image; do
+            if ! grep -qr "$marker" "$ORANGEFOX_TOP/build/make"; then
+              echo "::error::build/make 缺少橙狐标记 $marker, 补丁未生效"
+              exit 1
+            fi
+            echo "verified marker in build/make: $marker"
+          done
+          # 补丁改的是 config/BoardConfigSoong.mk (vendor/twrp 仓库内的路径)。
+          grep -q "orangefox_soong.mk" \
+            "$ORANGEFOX_TOP/vendor/twrp/config/BoardConfigSoong.mk" &&
+            echo "verified: vendor/twrp 已引入 orangefox_soong.mk"
+
+      - name: Install device tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ORANGEFOX_TOP/${{ github.event.inputs.DEVICE_PATH }}"
+          rsync -a --delete \
+            --exclude .git \
+            "$GITHUB_WORKSPACE/device-tree/" \
+            "$ORANGEFOX_TOP/${{ github.event.inputs.DEVICE_PATH }}/"
+
+          # 兜底补执行位。设备树在 Windows 上开发, git 默认 core.filemode=false,
+          # 会忽略执行位变化, 脚本可能以 100644 提交。AOSP 构建会直接执行
+          # <device>/recovery/prepare-ramdisk.sh 等脚本, 缺少执行位时报错:
+          #   /bin/bash: line 1: device/.../prepare-ramdisk.sh: Permission denied
+          # 这个坑在 Windows 上完全看不出来, 只在 Linux CI 暴露, 故在此兜底。
+          echo "::group::修正设备树脚本执行位"
+          find "$ORANGEFOX_TOP/${{ github.event.inputs.DEVICE_PATH }}" \
+            -type f -name '*.sh' -print -exec chmod +x {} \; || true
+          echo "::endgroup::"
+
+      - name: Clone common tree
+        if: ${{ github.event.inputs.COMMON_TREE_URL != '' && github.event.inputs.COMMON_PATH != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 \
+            ${{ github.event.inputs.COMMON_TREE_URL }} \
+            -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} \
+            "$ORANGEFOX_TOP/${{ github.event.inputs.COMMON_PATH }}"
+
+      - name: Apply device tree patches
+        shell: bash
+        working-directory: ${{ env.ORANGEFOX_TOP }}
+        run: |
+          set -euo pipefail
+          # 设备树的 apply-patches.sh 必须在源码根目录执行; 无补丁时为空操作。
+          script="${{ github.event.inputs.DEVICE_PATH }}/apply-patches.sh"
+          if [[ -f "$script" ]]; then
+            chmod +x "$script"
+            sh "$script"
+          fi
+
+      # 必须在编译**之前**跑。偏移溢出只会在 ninja 的最后一个 target 上暴露:
+      #     struct.error: 'I' format requires 0 <= number <= 4294967295
+      # 而那时前面 18000+ 个 target 已经全部跑完 —— 真实代价是 45 分钟白跑。
+      # 这里用 1 秒的静态检查把它提前到编译之前。
+      # 根因: vendor_boot.json 里的地址是**绝对加载地址**, 而 mkbootimg 的
+      # --*_offset 是相对 --base 的偏移, header 里存的是 base + offset。
+      - name: Validate boot image offsets
+        shell: bash
+        run: |
+          set -euo pipefail
+          configs=()
+          for path in "${{ github.event.inputs.DEVICE_PATH }}" \
+                       "${{ github.event.inputs.COMMON_PATH }}"; do
+            if [[ -z "$path" ]]; then
+              continue
+            fi
+            config="$ORANGEFOX_TOP/$path/BoardConfig.mk"
+            if [[ -f "$config" ]]; then
+              configs+=("$config")
+            fi
+          done
+          if [[ "${#configs[@]}" -eq 0 ]]; then
+            echo "::error::未找到任何 BoardConfig.mk, 设备树未正确安装"
+            exit 1
+          fi
+          # 退出码: 0 = 通过; 1 = 偏移溢出 (必然失败, 立刻停);
+          #         2 = 用法错误 / 模板未填占位符导致无法校验 —— 也当失败处理。
+          bash "$GITHUB_WORKSPACE/builder/.github/scripts/check-boot-offsets.sh" "${configs[@]}"
+
+      - name: Sync Device Dependencies
+        shell: bash
+        working-directory: ${{ env.ORANGEFOX_TOP }}
+        run: |
+          set -euo pipefail
+          # 必须在删除 .repo 之前完成; omni_*.dependencies / twrp_*.dependencies 二者取其一。
+          for dep in omni twrp; do
+            f="${{ github.event.inputs.DEVICE_PATH }}/$dep.dependencies"
+            if [[ -f "$f" ]]; then
+              bash "$GITHUB_WORKSPACE/builder/scripts/convert.sh" "$f"
+              break
+            fi
+          done
+          repo sync -j"$(nproc)"
+
+      - name: Drop sync metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$ORANGEFOX_TOP/.repo" \
+            "$GITHUB_WORKSPACE/ofox-sync" \
+            "$GITHUB_WORKSPACE/pinned-manifest" \
+            "$GITHUB_WORKSPACE/ci-gitconfig"
+          df -h "$GITHUB_WORKSPACE"
+          free -h
+
+      - name: Check compilation capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          available_kib="$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 { print $4 }')"
+          required_kib=$((REQUIRED_COMPILE_DISK_GIB * 1024 * 1024))
+          if [[ -z "${available_kib}" || "${available_kib}" -lt "${required_kib}" ]]; then
+            echo "::error::删除 .repo 后需要至少 ${REQUIRED_COMPILE_DISK_GIB} GiB (实测 $((available_kib / 1024 / 1024)) GiB)。"
+            exit 1
+          fi
+          du -sh "$ORANGEFOX_TOP"
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Building OrangeFox
+        shell: bash
+        working-directory: ${{ env.ORANGEFOX_TOP }}
+        env:
+          ALLOW_MISSING_DEPENDENCIES: 'true'
+          FOX_BUILD_DEVICE: ${{ github.event.inputs.DEVICE_NAME }}
+          FOX_AB_DEVICE: '1'
+          FOX_VIRTUAL_AB_DEVICE: '1'
+          OF_FORCE_PREBUILT_KERNEL: '1'
+          OF_LOW_MEMORY_BUILD: '1'
+          GOMEMLIMIT: '3GiB'
+          GOGC: '20'
+          _JAVA_OPTIONS: '-Xmx3g'
+          USE_CCACHE: '1'
+          CCACHE_EXEC: /usr/bin/ccache
+          CCACHE_COMPILERCHECK: content
+          CCACHE_COMPRESS: 'true'
+        run: |
+          set -euo pipefail
+          build_jobs="$(nproc)"
+          export OF_BUILD_JOBS="$build_jobs"
+          export NINJA_ARGS="-j${build_jobs} -l${build_jobs}"
+          export SOONG_UI_NINJA_ARGS="$NINJA_ARGS"
+          printf 'Using %s Ninja jobs\n' "$build_jobs"
+
+          (
+            while sleep 60; do
+              date -u '+%Y-%m-%dT%H:%M:%SZ build heartbeat'
+              df -h "$GITHUB_WORKSPACE"
+              free -h
+            done
+          ) &
+          heartbeat_pid=$!
+          trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
+
+          set +u
+          source build/envsetup.sh
+          lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+
+          # OrangeFox 把 /tmp/<device>/fox_env.sh 的生成挂在 **printconfig()** 里
+          # (见 ROTHO_Twrp/patches/orangefox-build-make.patch 的 envsetup.sh hunk),
+          # 而 lunch 并不会调用 printconfig。不补这一步, bootable/recovery 的
+          # OrangeFox_A14.sh 就拿不到 FOX_*/OF_* 变量, 日志里会出现:
+          #   ** WARNING: /tmp/<device>/fox_env.sh is not found. Your build vars
+          #      will probably not be implemented. **
+          # printconfig 顺带把完整构建变量打进日志, 排查时很有用。
+          printconfig || true
+          fox_env="/tmp/${{ github.event.inputs.DEVICE_NAME }}/fox_env.sh"
+          if [[ ! -f "$fox_env" ]]; then
+            echo "::warning::printconfig 未生成 $fox_env, 用当前环境兜底"
+            mkdir -p "$(dirname "$fox_env")"
+            export > "$fox_env"
+          fi
+
+          # 逐个目标分别构建, 不用一条 `make A B -j`。
+          # 合并构建时并行输出会互相淹没, 定位不到是哪个目标失败; 分开后
+          # 每个目标有独立日志, 便于定位失败目标。
+          build_target_log="$GITHUB_WORKSPACE/orangefox-build.log"
+          : > "$build_target_log"
+
+          for target in ${{ github.event.inputs.BUILD_TARGET }}; do
+            echo "===== BUILD TARGET: $target =====" | tee -a "$build_target_log"
+            if make "$target" -j"$build_jobs" 2>&1 | tee -a "$build_target_log"; then
+              echo "===== TARGET OK: $target =====" | tee -a "$build_target_log"
+            else
+              echo "===== TARGET FAILED: $target =====" | tee -a "$build_target_log"
+              echo "::error::构建目标 $target 失败, 详见上方日志中的 TARGET FAILED 段落"
+              kill "$heartbeat_pid" 2>/dev/null || true
+              trap - EXIT
+              # 构建失败立即失败退出: 不掩盖失败, 也不继续执行后续步骤。
+              exit 1
+            fi
+          done
+
+          kill "$heartbeat_pid" 2>/dev/null || true
+          trap - EXIT
+
+      # 构建成功 ≠ 产物可用。下面这几类问题 ninja 一律不报错, 只能构建后查:
+      #   1. recovery 载荷没被装进 recovery root (337 个 .ko / firmware /
+      #      vendor HAL) -> 刷进去的 recovery 起不来。
+      #      注意别用 ramdisk-files.txt 判断: build/make 在调用
+      #      BOARD_RECOVERY_IMAGE_PREPARE 之前就把它建好了, 钩子跑没跑都在。
+      #      只能按文件名逐一比对 prebuilt 与 ramdisk。
+      #   2. mkbootfs 打不开 vendor_ramdisk 目录时只打印一行就继续, ninja 视而
+      #      不见, 最终 vendor_ramdisk00 是空包。
+      #   3. 静态校验过了, 但构建产物的 header 地址仍可能与官方不一致。
+      - name: Verify recovery payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 本步骤只对会产出 recovery ramdisk 的目标有意义。
+          if [[ "${{ github.event.inputs.BUILD_TARGET }}" != *recoveryimage* ]] &&
+             [[ "${{ github.event.inputs.BUILD_TARGET }}" != *vendorbootimage* ]]; then
+            echo "BUILD_TARGET 不含 recoveryimage / vendorbootimage, 跳过 ramdisk 载荷自检"
+            exit 0
+          fi
+
+          device_dir="$ORANGEFOX_TOP/${{ github.event.inputs.DEVICE_PATH }}"
+          product="$ORANGEFOX_TOP/out/target/product/${{ github.event.inputs.DEVICE_NAME }}"
+          root="$product/recovery/root"
+          build_log="$GITHUB_WORKSPACE/orangefox-build.log"
+
+          if [[ ! -d "$root" ]]; then
+            echo "::error::未生成 recovery root: $root"
+            exit 1
+          fi
+
+          echo "::group::ramdisk 载荷自检"
+
+          # 0) 设备树若完全不提供 recovery 载荷目录, 说明它走的是纯 AOSP
+          #    recovery 路径 (recovery root 由 build/make 自行生成), 本自检
+          #    无从比对, 直接跳过。不能把这种情况当失败: 设备树没声明载荷,
+          #    就没有"载荷没装进 ramdisk"这回事。
+          modules_dir="$device_dir/prebuilt/recovery_modules"
+          if [[ ! -d "$modules_dir" ]]; then
+            echo "设备树无 prebuilt/recovery_modules 目录, 跳过 essential 模块比对"
+            echo "::endgroup::"
+            # 仍做与模块无关的两项检查: 清单存在性 + 产物 header。
+            for f in "$root/ramdisk-files.txt" "$root/ramdisk-files.sha256sum"; do
+              [[ -f "$f" ]] || echo "::warning::缺少 $(basename "$f")"
+            done
+            if [[ -f "$product/vendor_boot.img" ]]; then
+              unpack="$ORANGEFOX_TOP/system/tools/mkbootimg/unpack_bootimg.py"
+              if [[ -f "$unpack" ]]; then
+                echo "::group::构建产物 vendor_boot.img header"
+                python3 "$unpack" \
+                  --boot_img "$product/vendor_boot.img" \
+                  --out "$GITHUB_WORKSPACE/vb-header-check" || true
+                echo "::endgroup::"
+              fi
+            fi
+            exit 0
+          fi
+
+          # 1) prebuilt 里的每个 ESSENTIAL 模块都必须出现在 ramdisk 中。
+          #    只比总数会误判 (构建系统自身也可能往 lib/modules 塞模块), 故逐个核对。
+          #    设备树可提供 essential_modules.txt 白名单来控制装哪些模块
+          #    (vendor_boot 有 128MB 分区上限, 337 个全装会超限)。
+          essential_list="$modules_dir/essential_modules.txt"
+          shopt -s nullglob
+          if [[ -f "$essential_list" ]]; then
+            # 从白名单文件逐行读取, 只校验声明的模块
+            prebuilt_modules=()
+            while IFS= read -r mod || [[ -n "$mod" ]]; do
+              [[ -n "$mod" ]] || continue
+              prebuilt_modules+=("$modules_dir/$mod")
+            done < "$essential_list"
+          else
+            prebuilt_modules=("$modules_dir"/*.ko)
+          fi
+          shopt -u nullglob
+
+          if [[ "${#prebuilt_modules[@]}" -eq 0 ]]; then
+            echo "::error::设备树 prebuilt/recovery_modules 下没有 .ko (或 essential_modules.txt 为空)"
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          missing=()
+          for module in "${prebuilt_modules[@]}"; do
+            if [[ ! -f "$root/lib/modules/$(basename "$module")" ]]; then
+              missing+=("$(basename "$module")")
+            fi
+          done
+          if [[ "${#missing[@]}" -gt 0 ]]; then
+            echo "::error::ramdisk 缺少 ${#missing[@]}/${#prebuilt_modules[@]} 个 essential 模块, 例: ${missing[*]:0:5}"
+            echo "::error::BOARD_RECOVERY_IMAGE_PREPARE (recovery/prepare-ramdisk.sh) 未把载荷装进 recovery root"
+            echo "::endgroup::"
+            exit 1
+          fi
+          echo "内核模块: ${#prebuilt_modules[@]} 个 essential 模块全部就位"
+          test -f "$root/lib/modules/modules.dep"
+
+          # 2) 清单只作信息输出, **不能**当作钩子执行过的证据:
+          #    build/make 在调用 BOARD_RECOVERY_IMAGE_PREPARE 之前就已经
+          #    `touch ramdisk-files.txt ramdisk-files.sha256sum` 并填好内容了
+          #    (见 ROTHO_Twrp/patches/orangefox-build-make.patch), 所以钩子
+          #    跑没跑过这个文件都在。真正能证明的是上面的逐名模块比对。
+          test -f "$root/ramdisk-files.txt"
+          echo "ramdisk 清单: $(wc -l < "$root/ramdisk-files.txt") 条"
+          test -f "$root/ramdisk-files.sha256sum"
+
+          # 3) mkbootfs 的静默失败。最终镜像由 package-vendor-boot.sh 用
+          #    prebuilt 平台片段重建, 不受影响, 但设备树需要修。
+          if [[ -f "$build_log" ]] && grep -q 'mkbootfs: cannot open directory' "$build_log"; then
+            echo "::warning::mkbootfs 打不开 vendor_ramdisk 目录, 构建产物 vendor_ramdisk00 是空包"
+            echo "::warning::最终镜像不受影响 (package-vendor-boot.sh 用 prebuilt 平台片段重建), 但建议修复设备树"
+          fi
+          echo "::endgroup::"
+
+          # 4) 运行时确认构建产物 header 的绝对地址, 与静态校验互为印证。
+          if [[ -f "$product/vendor_boot.img" ]]; then
+            unpack="$ORANGEFOX_TOP/system/tools/mkbootimg/unpack_bootimg.py"
+            if [[ -f "$unpack" ]]; then
+              echo "::group::构建产物 vendor_boot.img header"
+              python3 "$unpack" \
+                --boot_img "$product/vendor_boot.img" \
+                --out "$GITHUB_WORKSPACE/vb-header-check" || true
+              echo "::endgroup::"
+            fi
+          fi
+
+      # 虚拟 A/B 设备三条可选路线, 按优先级:
+      #   A) 设备树自带 package-vendor-boot.sh —— 用 stock 平台片段 + recovery 片段
+      #      + DTB 重组, 追加 AVB 尾。
+      #   B) 设备树提供 prebuilt/vendor_ramdisk/platform.cpio.lz4 —— 用官方平台
+      #      片段 + 构建出的 recovery 片段重新 mkbootimg。这是 PD2415 走的路线:
+      #      AOSP 的 vendor_ramdisk00 只收内核模块, 本树无内核模块, 该片段恒为空
+      #      (4 字节), 首阶段 /init 与 fstab 全缺, 刷进去卡 logo。
+      #   C) 以上都没有 —— 直接采用 AOSP `vendorbootimage` 产物 (骨架正确, 但
+      #      vendor_ramdisk00 为空, 仅适合排查)。
+      # 三条路线都以 <DEVICE_NAME>-vendor-boot.img 的名义收录, 下游不区分。
+      - name: Package vendor_boot image
+        id: package_vendor_boot
+        # 构建失败时本步骤会自动跳过; 此条件仅用于排除 BUILD_TARGET 未包含
+        # vendorbootimage 的情形。
+        if: ${{ contains(github.event.inputs.BUILD_TARGET, 'vendorbootimage') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          device_dir="$ORANGEFOX_TOP/${{ github.event.inputs.DEVICE_PATH }}"
+          script="$device_dir/package-vendor-boot.sh"
+          product="$ORANGEFOX_TOP/out/target/product/${{ github.event.inputs.DEVICE_NAME }}"
+          # 输出目录必须在 $GITHUB_WORKSPACE 内:
+          # 脚本会用 mktemp -d 在输出目录下建临时工作区, 源码分区更紧张。
+          final_dir="$GITHUB_WORKSPACE/final"
+          mkdir -p "$final_dir"
+          final_image="$final_dir/${{ github.event.inputs.DEVICE_NAME }}-vendor-boot.img"
+
+          platform_lz4="$device_dir/prebuilt/vendor_ramdisk/platform.cpio.lz4"
+          bootconfig="$device_dir/prebuilt/vendor_ramdisk/bootconfig"
+          built="$product/vendor_boot.img"
+
+          if [[ -f "$script" ]]; then
+            echo "::group::组装最终 vendor_boot 镜像 (package-vendor-boot.sh)"
+            sh "$script" "$ORANGEFOX_TOP" "$final_image"
+            echo "::endgroup::"
+          elif [[ -f "$platform_lz4" ]]; then
+            # ---------------- 路线 B: 用官方平台片段重组 ----------------
+            echo "::group::用官方平台片段重组 vendor_boot (路线 B)"
+            unpack="$ORANGEFOX_TOP/system/tools/mkbootimg/unpack_bootimg.py"
+            mkbootimg="$ORANGEFOX_TOP/system/tools/mkbootimg/mkbootimg.py"
+            avbtool="$ORANGEFOX_TOP/external/avb/avbtool.py"
+            for f in "$built" "$unpack" "$mkbootimg" "$avbtool"; do
+              [[ -f "$f" ]] || { echo "::error::缺少必需输入: $f"; exit 1; }
+            done
+
+            work="$(mktemp -d "$final_dir/.vb.XXXXXX")"
+            trap 'rm -rf "$work"' EXIT
+
+            # 1) 拆出构建产物里的 recovery 片段 (vendor_ramdisk01)
+            python3 "$unpack" --boot_img "$built" --out "$work/built" > "$work/built-info.txt"
+            cat "$work/built-info.txt"
+            recovery_fragment="$work/built/vendor_ramdisk01"
+            [[ -f "$recovery_fragment" ]] ||
+              { echo "::error::构建产物里没有 vendor_ramdisk01 (recovery 片段)"; exit 1; }
+            rec_size=$(stat -c '%s' "$recovery_fragment")
+            if [[ "$rec_size" -lt 65536 ]]; then
+              echo "::error::recovery 片段仅 ${rec_size} 字节, 是空包"
+              exit 1
+            fi
+            echo "recovery 片段: ${rec_size} 字节"
+
+            # 2) 平台片段与 dtb 直接用设备树里的官方原件, 保证字节一致
+            dtb="$work/built/dtb"
+            if [[ ! -f "$dtb" ]]; then
+              dtb="$device_dir/prebuilt/dtb/pd2415.dtb"
+            fi
+            [[ -f "$dtb" ]] || { echo "::error::缺少 dtb"; exit 1; }
+
+            # 3) kernel: vAB 设备的 vendor_boot 不含 kernel (kernel 在 boot 分区,
+            #    TARGET_NO_KERNEL=true), unpack 出来没有该文件。mkbootimg 允许
+            #    --kernel 省略, 此时 kernel_size=0, 与官方镜像一致。
+            kernel="$work/built/kernel"
+            if [[ ! -f "$kernel" ]]; then
+              echo "vendor_boot 不含 kernel (vAB 设备正常), 按空 kernel 打包"
+              : > "$work/empty-kernel"
+              kernel="$work/empty-kernel"
+            fi
+
+            mkbootimg_args=(
+              --header_version 4
+              --pagesize 4096
+              --base 0x80000000
+              --kernel_offset 0x00000000
+              --ramdisk_offset 0x24b00000
+              --tags_offset 0x07c80000
+              --dtb_offset 0x07c80000
+              --kernel "$kernel"
+              --dtb "$dtb"
+              --vendor_ramdisk "$platform_lz4"
+              --ramdisk_type RECOVERY
+              --ramdisk_name recovery
+              --vendor_ramdisk_fragment "$recovery_fragment"
+              --vendor_boot "$work/vendor_boot.preavb.img"
+            )
+            # cmdline 以构建产物为准 (BoardConfig 已对齐官方)
+            cmdline="$(sed -n 's/^vendor command line args: //p' "$work/built-info.txt" | head -1)"
+            if [[ -n "$cmdline" ]]; then
+              mkbootimg_args+=(--vendor_cmdline "$cmdline")
+            fi
+            if [[ -f "$bootconfig" ]]; then
+              mkbootimg_args+=(--vendor_bootconfig "$bootconfig")
+            fi
+
+            python3 "$mkbootimg" "${mkbootimg_args[@]}"
+
+            # 4) 追加 AVB hash footer。--salt 必须是 hex;
+            #    algorithm 用 NONE 与 testkey 之外的方式会失败, 这里沿用
+            #    官方 footer 的算法 (NONE + sha256) 以便 BL 校验通过。
+            part_size=134217728
+            avb_salt=aee087a5be3b982978c923f566a94613496b417f2af592639bc80d141e34dfe7
+            cp "$work/vendor_boot.preavb.img" "$work/vendor_boot.img"
+            python3 "$avbtool" add_hash_footer \
+              --image "$work/vendor_boot.img" \
+              --partition_size "$part_size" \
+              --partition_name vendor_boot \
+              --hash_algorithm sha256 \
+              --salt "$avb_salt" \
+              --algorithm NONE
+            [[ "$(stat -c '%s' "$work/vendor_boot.img")" -eq "$part_size" ]] ||
+              { echo "::error::最终镜像大小不是 $part_size"; exit 1; }
+
+            # 5) 结构自检: 两个片段都要有内容, dtb/bootconfig 都要在
+            python3 "$unpack" --boot_img "$work/vendor_boot.img" --out "$work/out" \
+              > "$work/out-info.txt"
+            cat "$work/out-info.txt"
+            grep -q '^vendor boot image header version: 4$' "$work/out-info.txt" ||
+              { echo "::error::重组产物不是 v4"; exit 1; }
+            if grep -q '^dtb size: 0$' "$work/out-info.txt"; then
+              echo "::error::重组产物 dtb 段为空"; exit 1
+            fi
+            for frag in "$work/out"/vendor_ramdisk*; do
+              sz=$(stat -c '%s' "$frag")
+              echo "  $(basename "$frag"): $sz bytes"
+              [[ "$sz" -ge 65536 ]] ||
+                { echo "::error::$(basename "$frag") 是空包 (${sz} 字节)"; exit 1; }
+            done
+            [[ -f "$work/out/vendor_ramdisk01" ]] ||
+              { echo "::error::重组产物缺少 vendor_ramdisk01"; exit 1; }
+            echo "重组完成: 平台片段 + recovery 片段 + dtb + bootconfig"
+            install -m 0644 "$work/vendor_boot.img" "$final_image"
+            sha256sum "$final_image" > "$final_image.sha256"
+            echo "::endgroup::"
+          else
+            # ---------------- 路线 C: 直接用 AOSP 产物 ----------------
+            echo "设备树未提供平台片段, 直接采用 vendorbootimage 产物 (vendor_ramdisk00 为空)"
+            if [[ ! -f "$built" ]]; then
+              echo "::error::vendorbootimage 未产出 $built, 无法提供可刷镜像"
+              ls -all "$product" || true
+              exit 1
+            fi
+            # 校验它确实是 v4 且 ramdisk 片段里有真实载荷, 避免把空壳当成品发布。
+            # 只检查"片段存在"是不够的: mkbootfs 打不开 vendor_ramdisk 目录时
+            # 会产出 4 字节的空 cpio 归档, 文件照样存在, header 也照样是 v4。
+            unpack="$ORANGEFOX_TOP/system/tools/mkbootimg/unpack_bootimg.py"
+            if [[ -f "$unpack" ]]; then
+              python3 "$unpack" --boot_img "$built" --out "$GITHUB_WORKSPACE/vb-direct-check" \
+                > "$GITHUB_WORKSPACE/vb-direct-check.txt"
+              cat "$GITHUB_WORKSPACE/vb-direct-check.txt"
+              if ! grep -q '^vendor boot image header version: 4$' "$GITHUB_WORKSPACE/vb-direct-check.txt"; then
+                echo "::error::vendorbootimage 产物不是 vendor_boot v4"
+                exit 1
+              fi
+              fragments=("$GITHUB_WORKSPACE/vb-direct-check"/vendor_ramdisk*)
+              if [[ ! -e "${fragments[0]}" ]]; then
+                echo "::error::vendorbootimage 产物不含任何 vendor ramdisk 片段"
+                exit 1
+              fi
+              # 空 cpio (newc) 归档最小 4 字节; 真实 recovery ramdisk 是数 MiB 级。
+              # 阈值取 64 KiB: 远高于空包, 又远低于任何含 /system/bin/recovery 的包。
+              payload_bytes=0
+              for f in "${fragments[@]}"; do
+                sz=$(stat -c '%s' "$f")
+                echo "  $(basename "$f"): $sz bytes"
+                payload_bytes=$((payload_bytes + sz))
+              done
+              if [[ "$payload_bytes" -lt 65536 ]]; then
+                echo "::error::vendor ramdisk 片段合计仅 ${payload_bytes} 字节, 是空包 (recovery 未装入)"
+                echo "::error::通常意味着 mkbootfs 打不开 out/target/product/<DEVICE>/vendor_ramdisk 目录"
+                echo "::error::检查 BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT 与 BOARD_RECOVERY_IMAGE_PREPARE"
+                exit 1
+              fi
+              # dtb 段为空同样致命: vendor_boot v4 的 DTB 供 LK 选板用。
+              if grep -q '^dtb size: 0$' "$GITHUB_WORKSPACE/vb-direct-check.txt"; then
+                echo "::error::vendor_boot 的 dtb 段为空 (dtb size: 0), LK 无法选板"
+                exit 1
+              fi
+              echo "校验通过: v4, ${#fragments[@]} 个片段合计 ${payload_bytes} 字节, dtb 非空"
+            else
+              echo "::warning::找不到 unpack_bootimg.py, 跳过产物结构校验"
+            fi
+            install -m 0644 "$built" "$final_image"
+            sha256sum "$final_image" > "$final_image.sha256"
+          fi
+
+          test -f "$final_image" || { echo "::error::未生成 $final_image"; exit 1; }
+          ls -all "$final_dir"
+          echo "final-image=$final_image" >> "$GITHUB_OUTPUT"
+
+      - name: Report compiler cache
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ccache -s
+          du -sh "$CCACHE_DIR"
+
+      - name: Collect release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          product="$ORANGEFOX_TOP/out/target/product/${{ github.event.inputs.DEVICE_NAME }}"
+          test -d "$product"
+          rm -rf "$GITHUB_WORKSPACE/artifacts"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+          shopt -s nullglob
+          images=("$product"/OrangeFox-*.img "$product"/OrangeFox-*.zip)
+          shopt -u nullglob
+          skipped=()
+          for image in "${images[@]}"; do
+            # 虚拟 A/B 设备 (TARGET_NO_RECOVERY=true 且 BOARD_USES_RECOVERY_AS_BOOT
+            # 为空) 不生成 boot.img, 而 OrangeFox 的 Fox_After_Recovery_Image
+            # 固定执行 `cp boot.img ...`, 于是产物是一个 20+ MB 但内部没有任何
+            # 镜像的空壳 zip。收录它只会让人误刷, 在这里剔除。
+            case "$image" in
+              *.zip)
+                if ! unzip -Z1 "$image" 2>/dev/null | grep -qE '\.img$'; then
+                  skipped+=("$(basename "$image")")
+                  continue
+                fi
+                ;;
+            esac
+            cp -fp "$image" "$GITHUB_WORKSPACE/artifacts/"
+          done
+          # recovery.img 只在非虚拟 A/B 设备 (BOARD_USES_RECOVERY_AS_BOOT=true)
+          # 才产出。pd2415 是 TARGET_NO_RECOVERY=true 的虚拟 A/B 设备, 根本不产
+          # recovery.img, 缺失属正常, 不可当作致命错误 (否则 set -e 直接退出)。
+          if [[ -f "$product/recovery.img" ]]; then
+            cp -fp "$product/recovery.img" "$GITHUB_WORKSPACE/artifacts/"
+          fi
+          if [[ "${#skipped[@]}" -gt 0 ]]; then
+            echo "::warning::以下产物内无可刷镜像, 判定为打包空壳, 未收录: ${skipped[*]}"
+          fi
+
+          # 最终可刷镜像。Package vendor_boot image 步骤保证它一定存在:
+          # 有 package-vendor-boot.sh 时是重组版, 没有时就是 vendorbootimage
+          # 的直接产物。缺失即视为致命错误, 不再静默退回 vendor_boot.img
+          # (那样 artifact 里会出现两个内容相同、名字不同的镜像, 容易误刷)。
+          final_image="${{ steps.package_vendor_boot.outputs.final-image }}"
+          if [[ -z "$final_image" || ! -f "$final_image" ]]; then
+            echo "::error::未获得最终可刷镜像 (package_vendor_boot 步骤未产出)"
+            exit 1
+          fi
+          cp -fp "$final_image" "$GITHUB_WORKSPACE/artifacts/"
+
+          if [[ -z "$(ls -A "$GITHUB_WORKSPACE/artifacts")" ]]; then
+            echo "::error::没有收集到任何产物"
+            ls -all "$product"
+            exit 1
+          fi
+          (
+            cd "$GITHUB_WORKSPACE/artifacts"
+            sha256sum * > sha256sums.txt
+          )
+          cat > "$GITHUB_WORKSPACE/artifacts/build-info.md" <<EOF
+          Automated OrangeFox build for ${{ github.event.inputs.DEVICE_NAME }}.
+
+          - OrangeFox branch: fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+          - Device tree: ${{ github.event.inputs.DEVICE_TREE_URL }} (${{ github.event.inputs.DEVICE_TREE_BRANCH }})
+          - Lunch: ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+          - Target: ${{ github.event.inputs.BUILD_TARGET }}
+          - Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          Files:
+
+          - \`OrangeFox-*.img\` — recovery 镜像 (TWRP/OrangeFox 官方打包)
+          - \`OrangeFox-*.zip\` — recovery 刷机包。仅当包内确实含镜像时才收录;
+            虚拟 A/B 设备不产 boot.img, OrangeFox 会打出一个无镜像的空壳包,
+            该空壳包已在此次构建中被剔除。
+          - \`${{ github.event.inputs.DEVICE_NAME }}-vendor-boot.img\` — **最终可刷镜像**。
+            虚拟 A/B 设备请刷这一个。来源二选一: 设备树提供
+            \`package-vendor-boot.sh\` 时是"平台片段 + recovery 片段 + DTB + AVB 尾"
+            的重组版; 未提供时就是 AOSP \`vendorbootimage\` 的直接产物
+            (已校验为 vendor_boot v4 且含 ramdisk 片段)。
+          EOF
+          ls -all "$GITHUB_WORKSPACE/artifacts"
+
+      - name: Save compiler cache
+        if: ${{ success() && steps.ccache_restore.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: orangefox-ccache-${{ env.CCACHE_CACHE_VERSION }}-${{ runner.os }}-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.event.inputs.DEVICE_NAME }}
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: orangefox-${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orangefox-${{ github.event.inputs.DEVICE_NAME }}-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: orangefox-build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      # 自动提取失败真因, 省去在海量并行日志里人工翻找。
+      - name: Diagnose build failure
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$GITHUB_WORKSPACE/orangefox-build.log"
+          product="$ORANGEFOX_TOP/out/target/product/${{ github.event.inputs.DEVICE_NAME }}"
+
+          echo "::group::[1/5] 各构建目标结果"
+          if [[ -f "$log" ]]; then
+            grep -n '^===== \(BUILD \)\?TARGET' "$log" || echo "(无 TARGET 段落)"
+          else
+            echo "(无构建日志)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::[2/5] ninja FAILED 目标及失败命令"
+          if [[ -f "$log" ]]; then
+            # ninja 先打印 "FAILED: <target>", 紧接着是被中断的命令
+            grep -n -A 12 '^FAILED' "$log" | head -150 || echo "(未找到 FAILED 行)"
+          else
+            echo "(无构建日志)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::[3/5] 常见错误关键字扫描"
+          if [[ -f "$log" ]]; then
+            grep -n -i -E 'error:|error [0-9]+|No such file or directory|No rule to make|exceed|too large|out of|undefined|not defined' \
+              "$log" | head -80 || echo "(未匹配到常见错误关键字)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::[4/5] vendor_boot 相关产物大小"
+          if [[ -d "$product" ]]; then
+            ls -la "$product" 2>/dev/null \
+              | grep -E 'vendor_boot|ramdisk|recovery|dtb|kernel' || echo "(无相关产物)"
+            echo "--- 分区上限 ---"
+            echo "BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE 见下方配置"
+          else
+            echo "(out 目录不存在)"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::[5/5] 设备树 boot/vendor_boot 配置"
+          bc="$ORANGEFOX_TOP/${{ github.event.inputs.DEVICE_PATH }}/BoardConfig.mk"
+          if [[ -f "$bc" ]]; then
+            grep -n -E 'PARTITION_SIZE|MKBOOTIMG|RAMDISK|RECOVERY|BOOT_HEADER|PREBUILT' \
+              "$bc" || echo "(无匹配配置)"
+          fi
+          echo "::endgroup::"
+
+      - name: Clean build worktree
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$ORANGEFOX_TOP" \
+            "$GITHUB_WORKSPACE/ofox-sync" \
+            "$GITHUB_WORKSPACE/pinned-manifest" \
+            "$GITHUB_WORKSPACE/artifacts" \
+            "$GITHUB_WORKSPACE/final" \
+            "$GITHUB_WORKSPACE/ci-gitconfig"
+
+  release:
+    if: ${{ needs.build.result == 'success' && github.event.inputs.PUBLISH == 'true' }}
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: orangefox-${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-artifacts
+
+      - name: Verify images
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          test -f sha256sums.txt
+          sha256sum --check --strict sha256sums.txt
+
+      - name: Create prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          release_tag="${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          cat > "$GITHUB_WORKSPACE/release-notes.md" <<EOF
+          Automated OrangeFox build for ${{ github.event.inputs.DEVICE_NAME }}.
+
+          - OrangeFox branch: fox_${{ github.event.inputs.MANIFEST_BRANCH }}
+          - Device tree: ${{ github.event.inputs.DEVICE_TREE_URL }} (${{ github.event.inputs.DEVICE_TREE_BRANCH }})
+          - Lunch: ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+          - Target: ${{ github.event.inputs.BUILD_TARGET }}
+          - Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          gh release create "$release_tag" release-artifacts/* \
+            --repo "$GH_REPO" \
+            --title "OrangeFox ${{ github.event.inputs.DEVICE_NAME }} CI ${{ github.run_id }}" \
+            --notes-file "$GITHUB_WORKSPACE/release-notes.md" \
+            --prerelease
